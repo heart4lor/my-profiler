@@ -1,97 +1,140 @@
 #include <iostream>
-#include <sys/syscall.h>
 #include <unistd.h>
-#include <linux/perf_event.h>
-#include <cstring>
-#include <jvmti.h>
 #include <signal.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <jvmti.h>
 
-extern "C" {
-    // AsyncGetCallTrace API
-    void AsyncGetCallTrace(JavaThreadState* trace, jint depth, void* ucontext);
-}
+// Global variables
+int perf_fd = -1;
+jvmtiEnv* jvmti;
+JavaVM* jvm;
 
-struct JavaThreadState {
-    JvmtiThreadState state;
-    JvmtiEnv* jvmti;
-    jmethodID method[128]; // Up to 128 frames of stack
-    jint depth;
-};
+// Signal handler for SIGIO
+void signal_handler(int signum, siginfo_t* info, void* context) {
+    std::cout << "Signal handler triggered, signum: " << signum << std::endl;
 
-void handle_perf_event(int signo, siginfo_t* info, void* context) {
-    ucontext_t* uctx = (ucontext_t*)context;
+    if (info->si_fd != perf_fd) {
+        std::cout << "Signal from unknown source, not perf_event." << std::endl;
+        return;
+    }
 
-    JavaThreadState trace;
-    trace.depth = 128;
+    std::cout << "Perf event triggered!" << std::endl;
 
-    // Use AsyncGetCallTrace to collect stack traces
-    AsyncGetCallTrace(&trace, trace.depth, uctx);
-
-    // Process the collected stack trace
-    if (trace.state == THREAD_STATE_OK) {
-        for (int i = 0; i < trace.depth; i++) {
-            // jmethodID -> method name resolving can be done using JVMTI
-            std::cout << "Java method ID: " << trace.method[i] << std::endl;
+    JNIEnv* env;
+    int res = jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    
+    if (res == JNI_EDETACHED) {
+        if (jvm->AttachCurrentThread((void**)&env, NULL) != 0) {
+            std::cerr << "Failed to attach thread to JVM." << std::endl;
+            return;
         }
-    } else {
-        std::cerr << "Failed to capture stack trace" << std::endl;
+    }
+
+    // Try to capture the Java stack trace
+    jvmtiFrameInfo frames[10];
+    jint count;
+
+    jvmtiError err = jvmti->GetStackTrace(NULL, 0, 10, frames, &count);
+    if (err != JVMTI_ERROR_NONE) {
+        std::cerr << "Failed to get stack trace: " << err << std::endl;
+        return;
+    }
+
+    std::cout << "Captured stack trace:" << std::endl;
+    for (int i = 0; i < count; ++i) {
+        std::cout << frames[i].method_id << std::endl;
     }
 }
 
 int setup_perf_event() {
-    // Set up the perf event attributes (CPU cycles as an example)
-    struct perf_event_attr pea;
-    memset(&pea, 0, sizeof(struct perf_event_attr));
-    pea.type = PERF_TYPE_HARDWARE;
-    pea.size = sizeof(struct perf_event_attr);
-    pea.config = PERF_COUNT_HW_CPU_CYCLES;
-    pea.sample_period = 1000;  // Adjust as necessary
-    pea.sample_type = PERF_SAMPLE_IP;
-    pea.disabled = 1;
-    pea.exclude_kernel = 1;
-    pea.exclude_hv = 1;
+    struct perf_event_attr pe;
+    memset(&pe, 0, sizeof(struct perf_event_attr));
+    pe.type = PERF_TYPE_SOFTWARE;
+    pe.config = PERF_COUNT_SW_CPU_CLOCK;
+    pe.size = sizeof(struct perf_event_attr);
+    pe.sample_period = 10000; // Adjusted for more frequent sampling
+    pe.disabled = 1;
+    pe.exclude_kernel = 1;
+    pe.exclude_hv = 1;
 
-    // Open the perf event file descriptor
-    int fd = syscall(SYS_perf_event_open, &pea, 0, -1, -1, 0);
+    int fd = syscall(SYS_perf_event_open, &pe, 0, -1, -1, 0);
     if (fd == -1) {
-        std::cerr << "Error opening perf event: " << strerror(errno) << std::endl;
+        perror("perf_event_open failed");
         return -1;
     }
 
     return fd;
 }
 
-void install_signal_handler(int fd) {
+extern "C" {
+
+JNIEXPORT void JNICALL Java_Profiler_startProfiling(JNIEnv* env, jobject obj) {
+    if (perf_fd != -1) {
+        std::cerr << "Profiling is already started." << std::endl;
+        return;
+    }
+
+    // Register signal handler for SIGIO
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = handle_perf_event;
+    sa.sa_sigaction = signal_handler;
     sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGIO, &sa, nullptr);
-
-    // Set the file descriptor to non-blocking and enable signal-driven IO
-    fcntl(fd, F_SETFL, O_NONBLOCK | O_ASYNC);
-    fcntl(fd, F_SETSIG, SIGIO);
-    fcntl(fd, F_SETOWN, getpid());
-
-    // Start the perf event counter
-    ioctl(fd, PERF_EVENT_IOC_RESET, 0);
-    ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-}
-
-int main() {
-    // Initialize perf event
-    int fd = setup_perf_event();
-    if (fd == -1) {
-        return 1;
+    if (sigaction(SIGIO, &sa, NULL) == -1) {
+        perror("sigaction failed");
+        return;
     }
 
-    // Install signal handler for perf event
-    install_signal_handler(fd);
-
-    // Profiler loop (you can adapt this for a specific use case)
-    while (true) {
-        pause(); // Wait for perf event interrupts
+    // Setup perf event
+    perf_fd = setup_perf_event();
+    if (perf_fd == -1) {
+        return;
     }
 
-    return 0;
+    std::cout << "perf_event_open success, fd: " << perf_fd << std::endl;
+
+    // Set F_SETOWN and F_SETFL to enable async notification
+    if (fcntl(perf_fd, F_SETOWN, getpid()) == -1) {
+        perror("fcntl F_SETOWN failed");
+        return;
+    }
+    if (fcntl(perf_fd, F_SETFL, fcntl(perf_fd, F_GETFL) | O_ASYNC) == -1) {
+        perror("fcntl F_SETFL failed");
+        return;
+    }
+
+    // Enable perf event
+    if (ioctl(perf_fd, PERF_EVENT_IOC_RESET, 0) == -1) {
+        perror("ioctl PERF_EVENT_IOC_RESET failed");
+        return;
+    }
+    if (ioctl(perf_fd, PERF_EVENT_IOC_ENABLE, 0) == -1) {
+        perror("ioctl PERF_EVENT_IOC_ENABLE failed");
+        return;
+    }
+
+    std::cout << "Profiling started..." << std::endl;
 }
+
+JNIEXPORT void JNICALL Java_Profiler_stopProfiling(JNIEnv* env, jobject obj) {
+    if (perf_fd == -1) {
+        std::cerr << "Profiling is not started." << std::endl;
+        return;
+    }
+
+    // Stop perf event
+    if (ioctl(perf_fd, PERF_EVENT_IOC_DISABLE, 0) == -1) {
+        perror("ioctl PERF_EVENT_IOC_DISABLE failed");
+        return;
+    }
+
+    close(perf_fd);
+    perf_fd = -1;
+
+    std::cout << "Profiling stopped." << std::endl;
+}
+
+} // extern "C"
