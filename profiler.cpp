@@ -72,7 +72,7 @@ int setup_perf_event() {
 
 extern "C" {
 
-JNIEXPORT void JNICALL Java_Profiler_startProfiling(JNIEnv* env, jobject obj) {
+JNIEXPORT void JNICALL Java_TargetCode_startProfiling(JNIEnv* env, jobject obj) {
     if (perf_fd != -1) {
         std::cerr << "Profiling is already started." << std::endl;
         return;
@@ -119,7 +119,7 @@ JNIEXPORT void JNICALL Java_Profiler_startProfiling(JNIEnv* env, jobject obj) {
     std::cout << "Profiling started..." << std::endl;
 }
 
-JNIEXPORT void JNICALL Java_Profiler_stopProfiling(JNIEnv* env, jobject obj) {
+JNIEXPORT void JNICALL Java_TargetCode_stopProfiling(JNIEnv* env, jobject obj) {
     if (perf_fd == -1) {
         std::cerr << "Profiling is not started." << std::endl;
         return;
