@@ -1,7 +1,7 @@
 // File: TargetCode.java
 public class TargetCode {
     static {
-        System.loadLibrary("libmyprofiler"); // 加载本地库
+        System.loadLibrary("libmyprofiler.so"); // 加载本地库
     }
 
     // 声明本地方法
