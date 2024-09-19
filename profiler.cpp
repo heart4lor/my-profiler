@@ -46,7 +46,7 @@ void signal_handler(int signum, siginfo_t* info, void* context) {
 
     std::cout << "Captured stack trace:" << std::endl;
     for (int i = 0; i < count; ++i) {
-        std::cout << frames[i].method_id << std::endl;
+        std::cout << frames[i].method << std::endl;
     }
 }
 
